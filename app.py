@@ -1,7 +1,6 @@
-
 import asyncio
 import json
-from datetime import datetime ,timedelta,UTC
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import httpx
 from motor.motor_asyncio import AsyncIOMotorClient  # ✅ Motor
@@ -9,12 +8,12 @@ from pymongo.errors import ConnectionFailure
 from dotenv import load_dotenv
 import os
 from flask import Flask, jsonify
+import threading  # <-- added for threading
+
 # --- Constantes ---
 
-
-
-app=Flask(__name__)
-REGIONS = ["IND", "BD", "ME","BR"]
+app = Flask(__name__)
+REGIONS = ["IND", "BD", "ME", "BR"]
 BATCH_SIZE = 105
 CHECK_INTERVAL = 10  # en secondes
 REFRESH_INTERVAL = 6 * 60 * 60  # en secondes (6 heures)
@@ -31,7 +30,7 @@ JWT_SERVERS = [
     "https://rno-jwttt-eixu.vercel.app/",
     "https://jwttt-qpl8.vercel.app/",
     "https://rebel-jwttt-cftm.vercel.app/",
-    "https://wotax-jwt.vercel.app/"
+    "https://wotax-jwt.vercel.app/",
 ]
 load_dotenv()
 # --- Variables globales ---
@@ -40,15 +39,14 @@ db = None
 token_state = {}
 processing = {}
 
-
 MONGO_URI = os.getenv("MONGO_URI")
 print(MONGO_URI)
+
+UTC = timezone.utc  # Fix missing UTC timezone object
 
 async def init_mongo():
     global client, db
     try:
-
-        
         client = AsyncIOMotorClient(MONGO_URI)
         await client.admin.command("ping")  # ✅ maintenant possible
         db = client.get_database("spam_xpert")
@@ -71,7 +69,7 @@ async def load_token_state():
                 "last_token_update_time": None,
                 "current_index": 0,
                 "refresh_done": False,
-                "refresh_count": 0  
+                "refresh_count": 0,
             }
             await state_collection.insert_one(initial_state)
             token_state[region] = initial_state
@@ -81,16 +79,12 @@ async def load_token_state():
                 "last_token_update_time": doc.get("last_token_update_time", None),
                 "current_index": doc.get("current_index", 0),
                 "refresh_done": doc.get("refresh_done", False),
-                "refresh_count": doc.get("refresh_count", 0) 
+                "refresh_count": doc.get("refresh_count", 0),
             }
 
-
 async def save_token_state(region, updates):
-    await db.get_collection("token_state").update_one(
-        {"region": region}, {"$set": updates}
-    )
+    await db.get_collection("token_state").update_one({"region": region}, {"$set": updates})
     token_state[region].update(updates)
-
 
 async def refresh_tokens(region, should_update_index=True):
     file_path = Path(__file__).parent / f"data/{region.lower()}_data.json"
@@ -124,15 +118,16 @@ async def refresh_tokens(region, should_update_index=True):
                 res.raise_for_status()
                 token = res.json().get("token")
                 if token:
-                    token_docs.append({
-                                        "uid": uid,
-                                        "token": token,
-                                       "timestamp": datetime.now(UTC)
-                                       })
+                    token_docs.append(
+                        {
+                            "uid": uid,
+                            "token": token,
+                            "timestamp": datetime.now(UTC),
+                        }
+                    )
         except Exception as e:
-            err_msg = str(e)[:50]  
+            err_msg = str(e)[:50]
             print(f"[{region}] UID {uid} erreur : {err_msg}")
-
 
     for i in range(BATCH_SIZE):
         index = (start_index + i) % len(data)
@@ -186,7 +181,7 @@ async def move_tokens(region):
 
     await main_col.delete_many({})
     await main_col.insert_many(
-        [{"uid":t["uid"],   "token": t["token"], "timestamp": datetime.now(UTC)} for t in tokens_to_move]
+        [{"uid": t["uid"], "token": t["token"], "timestamp": datetime.now(UTC)} for t in tokens_to_move]
     )
     await temp_col.delete_many({})
 
@@ -210,14 +205,14 @@ async def check_loop():
             continue
         processing[region] = True
         try:
-            
+
             state = token_state[region]
             success_count = state["success_count"]
             refresh_done = state["refresh_done"]
             last_update_time = state.get("last_token_update_time")
 
             last_update_ts = last_update_time.timestamp() if isinstance(last_update_time, datetime) else 0
-            
+
             # 👉 Si aucun token n'existe, on génère immédiatement
             main_col = db.get_collection(f"{region.lower()}_tokens")
             existing = await main_col.count_documents({})
@@ -225,16 +220,18 @@ async def check_loop():
                 print(f"[{region}] 🚨 Aucune donnée. Génération forcée...")
                 refreshed = await refresh_tokens(region)
                 if refreshed > 0:
-                    await save_token_state(region, {
-                        "refresh_done": True,
-                        "last_token_update_time": datetime.now(UTC),
-                    })
+                    await save_token_state(
+                        region,
+                        {
+                            "refresh_done": True,
+                            "last_token_update_time": datetime.now(UTC),
+                        },
+                    )
                     await move_tokens(region)
                 continue  # on passe au suivant
-            time_since_last_update= now - last_update_ts
-           
+            time_since_last_update = now - last_update_ts
 
-           # 🔄 1️⃣ Rafraîchissement après 28 succès
+            # 🔄 1️⃣ Rafraîchissement après 28 succès
             if success_count >= 28 and not refresh_done:
                 print(f"[{region}] 🔄 28 succès. Rafraîchissement...")
                 refreshed = await refresh_tokens(region)
@@ -278,12 +275,10 @@ async def check_loop():
                         if refreshed_again > 0:
                             await save_token_state(region, {"last_token_update_time": datetime.now(UTC)})
 
-
         except Exception as err:
             print(f"[{region}] ❌ Erreur : {err}")
         finally:
             processing[region] = False
-
 
 
 async def start_token_manager():
@@ -296,17 +291,25 @@ async def start_token_manager():
             await asyncio.sleep(CHECK_INTERVAL)
     except Exception as e:
         print(f"[CRITIQUE] Erreur au démarrage : {e}")
-        
 
-# async def get_all_token_states():
-#     state_collection = db.get_collection("token_state")
-#     cursor = state_collection.find({})
-#     states = await cursor.to_list(None)
-#     return states
-       
+# ------------- Flask routes here if you have any --------------
+
+@app.route("/status")
+def status():
+    return jsonify({"status": "running"})
+
+
+# ----------- Updated main start to run Flask and async concurrently -----------
+
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))  # use env PORT if available
+    app.run(host="0.0.0.0", port=port)
+
+
 if __name__ == "__main__":
+    # Start Flask server in a separate thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # Run the async token manager in the main thread event loop
     asyncio.run(start_token_manager())
-    app.run(host="0.0.0.0", port=5000)
-    
-
-
